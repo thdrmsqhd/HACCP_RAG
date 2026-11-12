@@ -4,6 +4,7 @@ LLM은 문장화만 담당하고, 근거는 반드시 검색된 출처를 인용
 """
 import json
 import re
+import time
 import urllib.request
 
 from search_all import Unified
@@ -11,16 +12,16 @@ from search_all import Unified
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "hermes-test-qwen38-9b:q4"
 KEEP_ALIVE = "30m"          # 모델 언로드로 인한 30~40초 콜드스타트 방지
-NUM_PREDICT = 160           # 3줄 답변은 약 100~120토큰
+NUM_PREDICT = 110           # 3줄 답변 목표. 길게 쓰면 느려지고 잘린다
 
 PROMPT = """/no_think
 너는 HACCP을 처음 접하는 품질 담당자를 돕는 안내 도우미다.
 아래 [근거]만 사용해 한국어로 답한다. 근거에 없는 내용은 쓰지 않는다.
 
 출력은 정확히 아래 세 줄만 쓴다. 다른 말은 절대 쓰지 않는다.
-[설명] 쉽게 2~3문장
-[근거] 출처만 나열 (예: 제10조, 평가매뉴얼 p.22)
-[다음 할 일] 지금 할 일 1~2개
+[설명] 쉽게 1~2문장. 120자 이내.
+[근거] 출처 이름만. 본문을 인용하지 말 것. 예: 제10조, 평가매뉴얼 p.22
+[다음 할 일] 한 문장.
 
 질문: {q}
 
@@ -71,7 +72,16 @@ def _clean(raw: str) -> str:
     raw = raw.strip()
     if "[설명]" in raw:
         raw = raw[raw.index("[설명]"):]
-    return raw
+    # 모델이 [근거] 줄에 조문 본문을 길게 인용하면 잘라낸다(토큰·가독성)
+    out = []
+    for line in raw.split("\n"):
+        if line.startswith("[근거]"):
+            body = " ".join(line[4:].split())
+            if len(body) > 100:
+                body = body[:100].rstrip() + "…"
+            line = "[근거] " + body
+        out.append(line)
+    return "\n".join(out).strip()
 
 
 def hits_meta(hits):
@@ -103,24 +113,34 @@ GUARD = """
 
 
 def ask(q):
+    t0 = time.time()
     hits = retrieve(q)
+    t1 = time.time()
     if not hits:
         return {"answer": "[설명] 근거를 찾지 못했습니다.\n[근거] 없음\n[다음 할 일] 질문을 업무 단계로 나눠 다시 물어보세요.", "hits": []}
     ctx = build_prompt(q, hits)
-    text = _generate(ctx)
+    text, gen1 = _generate(ctx)
+    t2 = time.time()
     bad = unsupported_numbers(text, _context_text(hits))
+    gen2 = 0.0
+    retried = False
     if bad:  # 근거에 없는 수치 → 한 번 더 엄격 모드로 재생성
-        text = _generate(GUARD + ctx)
+        retried = True
+        text, gen2 = _generate(GUARD + ctx)
         bad = unsupported_numbers(text, _context_text(hits))
-    return {"answer": text, "hits": hits_meta(hits), "unsupported_numbers": bad}
+    return {"answer": text, "hits": hits_meta(hits), "unsupported_numbers": bad,
+            "timing": {"retrieve": round(t1 - t0, 2), "gen1": round(gen1, 2),
+                       "gen2": round(gen2, 2), "retried": retried,
+                       "total": round(time.time() - t0, 2)}}
 
 
 def _generate(prompt):
+    t0 = time.time()
     req = urllib.request.Request(OLLAMA, data=_payload(prompt, False),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=240) as r:
         out = json.loads(r.read().decode())
-    return _clean(out.get("response", ""))
+    return _clean(out.get("response", "")), round(time.time() - t0, 2)
 
 
 def ask_stream(q):
