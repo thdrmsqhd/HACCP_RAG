@@ -41,6 +41,31 @@ FAMILY_RE = {
 }
 
 
+# 질문 어휘 → 문서 어휘 (BM25는 표면형이 달라지면 못 찾는다)
+SYN_Q = {
+    "위생설비": ["세척", "소독", "구비"],
+    "설비": ["세척", "소독", "구비", "설치"],
+    "갖춰": ["구비", "설치"],
+    "갖추": ["구비", "설치"],
+    "구비": ["설치"],
+    "수칙": ["기준"],
+    "복장": ["위생복"],
+    "출입구": ["출입"],
+    "수립": ["설정", "운영"],
+}
+
+
+def query_tokens(q: str) -> list[str]:
+    """질문 토큰 + 동의어 확장(중복 제거)."""
+    base = tokens(q)
+    out = list(dict.fromkeys(base))
+    for t in base:
+        for k, vs in SYN_Q.items():
+            if k in t:
+                out.extend(v for v in vs if v not in out)
+    return out
+
+
 def unit_family(q: str):
     if re.search(r"언제까지|며칠|몇\s*(?:년|개월|일)|기한|기간|얼마나\s*보관", q):
         return "기간"
@@ -143,8 +168,8 @@ class Unified:
         self.bm_art = _BM25(self.art_docs, list(range(len(self.art_docs))))
 
     def rank_articles(self, q, k=2):
-        """조문 단위 BM25로 후보 조문을 고른다(질문 용어 포함률 하한 적용)."""
-        qtoks = tokens(q)
+        """조문 단위 BM25로 후보 조문을 고른다."""
+        qtoks = query_tokens(q)
         scored = []
         for i, d in enumerate(self.art_docs):
             s = self.bm_art.score(qtoks, i)
@@ -180,7 +205,7 @@ class Unified:
         return [(min(1.0, s / GOSI_FULL), self.docs[i]) for s, i in scored[:k]]
 
     def rank_pages(self, q, k=2):
-        qtoks = tokens(q)
+        qtoks = query_tokens(q)
         scored = [(self.bm_page.score(qtoks, i), i) for i in self.page_idx]
         scored = [(min(1.0, s / BM25_FULL), i) for s, i in scored if s > 0]
         scored.sort(key=lambda x: -x[0])
