@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HACCP 도우미</title>
+<style>
+  :root { --line:#e3e6ea; --muted:#6b7280; --accent:#1f6feb; --bg:#f7f8fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:'Malgun Gothic',system-ui,sans-serif; background:var(--bg); color:#111; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 20px; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { font-size:16px; margin:0; }
+  header .sub { font-size:12px; color:var(--muted); }
+  main { max-width:900px; margin:0 auto; padding:20px; }
+  .steps { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:18px; }
+  .step { background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px; cursor:pointer; }
+  .step.active { border-color:var(--accent); box-shadow:0 0 0 2px rgba(31,111,235,.12); }
+  .step .n { font-size:11px; color:var(--muted); }
+  .step .t { font-size:13px; font-weight:600; margin-top:2px; }
+  .search { display:flex; gap:8px; margin-bottom:16px; }
+  .search input { flex:1; padding:12px 14px; border:1px solid var(--line); border-radius:10px; font-size:14px; background:#fff; }
+  .search button { padding:0 18px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:18px 20px; }
+  .card h3 { margin:0 0 10px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:.02em; }
+  .block { margin:0 0 14px; white-space:pre-wrap; line-height:1.65; font-size:14px; }
+  .block b { display:inline-block; min-width:64px; color:#111; }
+  .sources { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .chip { font-size:12px; background:#eef2f7; border:1px solid var(--line); border-radius:999px; padding:4px 10px; color:#374151; }
+  .chip.manual { background:#fdf3e7; }
+  .muted { color:var(--muted); font-size:12px; }
+  .loading { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>HACCP 도우미</h1>
+    <div class="sub">품질 담당자를 위한 근거 기반 안내 · 고시 36조문 + 평가매뉴얼 609쪽</div>
+  </div>
+  <div class="muted">내부 데모</div>
+</header>
+
+<main>
+  <div class="steps" id="steps"></div>
+
+  <div class="search">
+    <input id="q" placeholder="예: 인증 후 교육은 언제까지 받아야 하나요?" autocomplete="off">
+    <button onclick="ask()">질문</button>
+  </div>
+
+  <div class="card" id="out">
+    <h3>답변</h3>
+    <div class="muted">질문을 입력하면 근거 조항과 함께 정리해 드립니다.</div>
+  </div>
+</main>
+
+<script>
+const STEPS = [
+  {n:'1단계', t:'대상 판단', q:'우리 공장이 의무 적용인지 어떻게 판단하나요?'},
+  {n:'2단계', t:'선행요건', q:'식품제조가공업의 선행요건 항목은 무엇인가요?'},
+  {n:'3단계', t:'HACCP 계획', q:'HACCP 7원칙 순서를 알려주세요'},
+  {n:'4단계', t:'인증 신청', q:'인증 신청 때 어떤 서류를 내나요?'},
+  {n:'5단계', t:'인증 후 유지', q:'인증 후 교육은 언제까지 받아야 하나요?'}
+];
+const stepsEl = document.getElementById('steps');
+STEPS.forEach((s, i) => {
+  const d = document.createElement('div');
+  d.className = 'step' + (i === 0 ? ' active' : '');
+  d.innerHTML = `<div class="n">${s.n}</div><div class="t">${s.t}</div>`;
+  d.onclick = () => {
+    document.querySelectorAll('.step').forEach(e => e.classList.remove('active'));
+    d.classList.add('active');
+    document.getElementById('q').value = s.q;
+  };
+  stepsEl.appendChild(d);
+});
+
+async function ask() {
+  const q = document.getElementById('q').value.trim();
+  if (!q) return;
+  const out = document.getElementById('out');
+  out.innerHTML = '<h3>답변</h3><div class="loading">근거를 찾고 문장을 정리하는 중…</div>';
+  try {
+    const r = await fetch('/api/stream?q=' + encodeURIComponent(q));
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', hits = null, started = false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      if (!hits) {
+        const nl = buf.indexOf('\n');
+        if (nl < 0) continue;
+        try { hits = JSON.parse(buf.slice(0, nl)).hits || []; } catch (e) { hits = []; }
+        buf = buf.slice(nl + 1);
+      }
+      if (!started && !buf.includes('[설명]')) continue;
+      started = true;
+      out.innerHTML = '<h3>답변</h3>' + render(buf) + sources(hits) + '<div class="muted">생성 중…</div>';
+    }
+    out.innerHTML = '<h3>답변</h3>' + render(buf) + sources(hits);
+  } catch (e) {
+    out.innerHTML = `<h3>답변</h3><div class="muted">오류: ${e.message}</div>`;
+  }
+}
+function render(text) {
+  return text.split('\n').filter(Boolean).map(l => {
+    const m = l.match(/^\[(.+?)\]\s*(.*)$/);
+    return m ? `<div class="block"><b>${m[1]}</b> ${m[2]}</div>` : `<div class="block">${l}</div>`;
+  }).join('');
+}
+function sources(hits) {
+  if (!hits || !hits.length) return '';
+  const chips = hits.map(h =>
+    `<span class="chip ${h.source === '매뉴얼' ? 'manual' : ''}">${h.label}</span>`).join('');
+  return `<h3 style="margin-top:14px">검색된 근거</h3><div class="sources">${chips}</div>`;
+}
+document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') ask(); });
+</script>
+</body>
+</html>

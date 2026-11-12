@@ -1,0 +1,18 @@
+# 대용량 원본 (공개 자료, 재배포 가능하지만 용량 때문에 제외)
+corpus/01_공개자료/HACCP_평가심사매뉴얼_20250130.pdf
+
+# 재생성 가능한 산출물
+prototype/manual_embeddings.json
+prototype/*_cache/
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
