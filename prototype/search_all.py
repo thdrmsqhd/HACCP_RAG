@@ -17,6 +17,18 @@ from retrieve import GOSI, tokens
 K1, B = 1.5, 0.75
 GOSI_FULL = 12.0    # 조문 BM25 정규화 상한(법령 근거를 우선 노출)
 BM25_FULL = 15.0    # 매뉴얼 BM25 정규화 상한
+TITLE_BOOST = 2.0   # 질문어가 조문 제목에 걸리면 가중(예: "검증" → 제18조 감독기관의 검증기준)
+
+
+def title_hit(qtoks, title_toks) -> bool:
+    """질문어가 제목 단어에 포함되면 True (검증 ⊂ 검증기준)."""
+    for q in qtoks:
+        if len(q) < 2:
+            continue
+        for t in title_toks:
+            if q in t:
+                return True
+    return False
 
 MARKS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
 NUM_UNIT = re.compile(r"\d+\s*(년|개월|일|시간|회|점|%|퍼센트|명|개)")
@@ -103,7 +115,10 @@ class Unified:
         for i in self.gosi_idx:
             a = self.docs[i]["article"]
             self.art_text.setdefault(a, []).append(self.docs[i]["text"])
-        self.art_docs = [{"article": a, "toks": tokens(" ".join(t))} for a, t in self.art_text.items()]
+        titles = {f"제{a['num']}조": a["title"] for a in load_articles(GOSI)}
+        self.art_docs = [{"article": a,
+                          "toks": tokens(" ".join(t)),
+                          "title_toks": tokens(titles.get(a, ""))} for a, t in self.art_text.items()]
         self.bm_art = _BM25(self.art_docs, list(range(len(self.art_docs))))
 
     def rank_articles(self, q, k=2):
@@ -112,6 +127,8 @@ class Unified:
         scored = []
         for i, d in enumerate(self.art_docs):
             s = self.bm_art.score(qtoks, i)
+            if s > 0 and title_hit(qtoks, d["title_toks"]):
+                s *= TITLE_BOOST
             if s > 0:
                 scored.append((s, i))
         scored.sort(key=lambda x: -x[0])

@@ -7,6 +7,7 @@ import re
 import time
 import urllib.request
 
+from retrieve import tokens
 from search_all import Unified
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
@@ -17,6 +18,7 @@ NUM_PREDICT = 110           # 3줄 답변 목표. 길게 쓰면 느려지고 잘
 PROMPT = """/no_think
 너는 HACCP을 처음 접하는 품질 담당자를 돕는 안내 도우미다.
 아래 [근거]만 사용해 한국어로 답한다. 근거에 없는 내용은 쓰지 않는다.
+고시 조문과 평가매뉴얼의 내용이 다르면 **고시를 따른다**.
 
 출력은 정확히 아래 세 줄만 쓴다. 다른 말은 절대 쓰지 않는다.
 [설명] 쉽게 1~2문장. 120자 이내.
@@ -30,6 +32,8 @@ PROMPT = """/no_think
 """
 
 _U = None
+_CACHE = {}
+CACHE_MAX = 200
 
 
 def index():
@@ -40,23 +44,94 @@ def index():
     return _U
 
 
+def _numbers_by_family(text: str) -> dict[str, set[str]]:
+    fam = {"기간": r"(\d+)\s*(년|개월|일)", "시간": r"(\d+)\s*시간", "횟수": r"(\d+)\s*회",
+           "점수": r"(\d+)\s*점", "비율": r"(\d+)\s*(?:%|퍼센트)"}
+    out = {}
+    for k, pat in fam.items():
+        nums = {m.group(1) for m in re.finditer(pat, text)}
+        if nums:
+            out[k] = nums
+    return out
+
+
+def _drop_conflicting_manual(q, picked):
+    """법령(고시)과 매뉴얼의 숫자가 충돌하면 매뉴얼 쪽을 근거에서 뺀다.
+
+    예: “검증 결과 보완 기한” → 고시 제18조③ 1개월 vs 매뉴얼 p.18 3개월.
+    해설서를 함께 주면 모델이 해설서를 따라 법령과 다른 답을 낸다.
+    """
+    gosi = [d for _, d in picked if d["source"] == "고시"]
+    if not gosi:
+        return picked
+    gnum = _numbers_by_family(" ".join(d["text"] for d in gosi))
+    out = []
+    for s, d in picked:
+        if d["source"] == "매뉴얼" and gnum:
+            mnum = _numbers_by_family(d["text"])
+            if any(k in gnum and k in mnum and gnum[k] != mnum[k] for k in gnum):
+                continue
+        out.append((s, d))
+    return out
+
+
 def retrieve(q, per_source=2, max_articles=2):
     """근거 선별 — 2단계.
 
     1) 조문 단위 BM25로 후보 조문 최대 2개 (탐색형 질문에서 후보가 좁아지지 않게)
     2) 각 조문 안에서 항 단위 BM25로 최대 2개 (숫자 규정이 여러 항에 흩어져 있어서)
-    매뉴얼은 페이지 단위 상위 2쪽.
+    매뉴얼은 페이지 단위 상위 2쪽. 고시와 숫자가 충돌하는 매뉴얼은 제외.
     """
     u = index()
     picked = []
     for _, art in u.rank_articles(q, max_articles):
         picked.extend(u.chunks_of(art, q, 2))
     picked.extend(u.rank_pages(q, per_source))
-    return picked
+    return _drop_conflicting_manual(q, picked)
+
+
+def _snippet(text: str, q: str, limit: int = 150) -> str:
+    """근거에서 질문어와 겹치는 문장만 골라 자른다.
+
+    통짜로 넣으면 프롬프트가 2,000~3,000토큰이 되고, 이 모델은 프롬프트 처리도
+    ~32 tok/s라 첫 질의가 60초 이상 걸린다(캐시가 없을 때).
+    수량을 묻는 질문은 숫자+단위가 들어간 문장을 우선한다(예: “연 2회 이상 기술지원”).
+    """
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    qs = {t for t in tokens(q) if len(t) > 1}
+    quantity = bool(re.search(r"몇|얼마|며칠|기한|최대|최소", q))
+    # "70% 미만"처럼 숫자+부등호가 질문에 있으면 그 표현이 든 문장을 강하게 우선
+    q_phrases = [re.sub(r"\s+", "", m.group(0)) for m in re.finditer(r"\d+\s*%\s*(?:미만|이상)", q)]
+    sents = re.split(r"(?<=[.다])\s+", flat)
+    scored = []
+    for i, s in enumerate(sents):
+        overlap = sum(1 for t in qs if t in s)
+        has_num = bool(NUM_UNIT.search(s))
+        flat_s = re.sub(r"\s+", "", s)
+        phrase_hit = sum(1 for p in q_phrases if p in flat_s)
+        score = overlap * 2 + (2 if has_num else 0) + (3 if quantity and has_num else 0) + phrase_hit * 4
+        scored.append((score, -i, i, s))
+    scored.sort(reverse=True)
+    out, used = "", set()
+    for _, _, i, s in scored:
+        if i in used:
+            continue
+        cand = (out + " " + s).strip()
+        if len(cand) > limit:
+            continue
+        out = cand
+        used.add(i)
+        if len(out) > limit * 0.7:
+            break
+    if not out:                      # 질문어가 하나도 안 겹치면 앞부분
+        out = flat[:limit]
+    return out[:limit]
 
 
 def build_prompt(q, hits):
-    ctx = "\n".join(f"- ({d['source']} {d['label']}) " + " ".join(d["text"].split())[:600] for _, d in hits)
+    ctx = "\n".join(f"- ({d['source']} {d['label']}) " + _snippet(d["text"], q) for _, d in hits)
     return PROMPT.format(q=q, ctx=ctx)
 
 
@@ -93,6 +168,7 @@ def _context_text(hits):
 
 
 NUM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(년|개월|일|시간|회|점|%|퍼센트|명|개|쪽|차)")
+NUM_UNIT = re.compile(r"\d+\s*(년|개월|일|시간|회|점|%|퍼센트|명|개)")
 
 
 def unsupported_numbers(answer_text: str, ctx: str) -> list[str]:
@@ -112,12 +188,25 @@ GUARD = """
 """
 
 
+def _cache_key(q: str) -> str:
+    return re.sub(r"[\s?.,!~]+", "", q).lower()
+
+
 def ask(q):
     t0 = time.time()
+    key = _cache_key(q)
+    if key in _CACHE:
+        r = dict(_CACHE[key])
+        r["timing"] = {"total": round(time.time() - t0, 2), "cache": True,
+                       "retrieve": 0, "gen1": 0, "gen2": 0, "retried": False}
+        return r
     hits = retrieve(q)
     t1 = time.time()
     if not hits:
-        return {"answer": "[설명] 근거를 찾지 못했습니다.\n[근거] 없음\n[다음 할 일] 질문을 업무 단계로 나눠 다시 물어보세요.", "hits": []}
+        return {"answer": "[설명] 근거를 찾지 못했습니다.\n[근거] 없음\n[다음 할 일] 질문을 업무 단계로 나눠 다시 물어보세요.",
+                "hits": [],
+                "timing": {"total": round(time.time() - t0, 2), "retrieve": round(t1 - t0, 2),
+                           "gen1": 0, "gen2": 0, "retried": False}}
     ctx = build_prompt(q, hits)
     text, gen1 = _generate(ctx)
     t2 = time.time()
@@ -128,10 +217,14 @@ def ask(q):
         retried = True
         text, gen2 = _generate(GUARD + ctx)
         bad = unsupported_numbers(text, _context_text(hits))
-    return {"answer": text, "hits": hits_meta(hits), "unsupported_numbers": bad,
-            "timing": {"retrieve": round(t1 - t0, 2), "gen1": round(gen1, 2),
-                       "gen2": round(gen2, 2), "retried": retried,
-                       "total": round(time.time() - t0, 2)}}
+    result = {"answer": text, "hits": hits_meta(hits), "unsupported_numbers": bad,
+              "timing": {"retrieve": round(t1 - t0, 2), "gen1": round(gen1, 2),
+                         "gen2": round(gen2, 2), "retried": retried,
+                         "total": round(time.time() - t0, 2)}}
+    if len(_CACHE) >= CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
+    _CACHE[key] = result
+    return result
 
 
 def _generate(prompt):
