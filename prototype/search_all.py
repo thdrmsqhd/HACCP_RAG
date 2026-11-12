@@ -6,6 +6,7 @@
 - 조문은 **질문 용어 포함률 0.34 이상**일 때만 근거로 인정한다(무관 조문 차단).
 """
 import math
+import re
 import sys
 from collections import Counter
 
@@ -14,11 +15,11 @@ from manual_index import load_pages
 from retrieve import GOSI, tokens
 
 K1, B = 1.5, 0.75
-COV_MIN = 0.34      # 질문 용어가 조문에 등장하는 비율 하한
 GOSI_FULL = 12.0    # 조문 BM25 정규화 상한(법령 근거를 우선 노출)
 BM25_FULL = 15.0    # 매뉴얼 BM25 정규화 상한
 
 MARKS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
+NUM_UNIT = re.compile(r"\d+\s*(년|개월|일|시간|회|점|%|퍼센트|명|개)")
 
 
 def split_paragraphs(text: str) -> list[str]:
@@ -97,28 +98,60 @@ class Unified:
         self.bm_gosi = _BM25(self.docs, self.gosi_idx)
         self.bm_page = _BM25(self.docs, self.page_idx)
 
-    def search(self, q, topk=3):
-        qtoks = tokens(q)
-        qset = set(qtoks)
-
-        gosi = []
+        # 조문 단위 인덱스 — 항 단위만 쓰면 탐색형 질문에서 조문 후보가 좁아진다.
+        self.art_text = {}
         for i in self.gosi_idx:
-            cov = len(qset & set(self.docs[i]["toks"])) / max(1, len(qset))
-            if cov < COV_MIN:
-                continue
+            a = self.docs[i]["article"]
+            self.art_text.setdefault(a, []).append(self.docs[i]["text"])
+        self.art_docs = [{"article": a, "toks": tokens(" ".join(t))} for a, t in self.art_text.items()]
+        self.bm_art = _BM25(self.art_docs, list(range(len(self.art_docs))))
+
+    def rank_articles(self, q, k=2):
+        """조문 단위 BM25로 후보 조문을 고른다(질문 용어 포함률 하한 적용)."""
+        qtoks = tokens(q)
+        scored = []
+        for i, d in enumerate(self.art_docs):
+            s = self.bm_art.score(qtoks, i)
+            if s > 0:
+                scored.append((s, i))
+        scored.sort(key=lambda x: -x[0])
+        return [(s, self.art_docs[i]["article"]) for s, i in scored[:k]]
+
+    def chunks_of(self, art, q, k=2):
+        """한 조문 안에서 질의에 맞는 항을 고른다.
+
+        수량을 묻는 질문(“몇 년/몇 시간/며칠”)은 숫자+단위가 들어간 항을 우선한다.
+        숫자는 질문에 없어서 BM25로는 찾히지 않는다(예: “기록 보관” → “2년”).
+        """
+        qtoks = tokens(q)
+        idx = [i for i in self.gosi_idx if self.docs[i]["article"] == art]
+        quantity = bool(re.search(r"몇|얼마|기간|언제까지|최대|최소", q))
+        scored = []
+        for i in idx:
             s = self.bm_gosi.score(qtoks, i)
+            has_num = bool(NUM_UNIT.search(self.docs[i]["text"]))
+            if quantity and has_num:
+                s *= 1.5
             if s > 0:
-                gosi.append((min(1.0, s / GOSI_FULL), i))
+                scored.append((s, i))
+        scored.sort(key=lambda x: -x[0])
+        return [(min(1.0, s / GOSI_FULL), self.docs[i]) for s, i in scored[:k]]
 
-        pages = []
-        for i in self.page_idx:
-            s = self.bm_page.score(qtoks, i)
-            if s > 0:
-                pages.append((min(1.0, s / BM25_FULL), i))
+    def rank_pages(self, q, k=2):
+        qtoks = tokens(q)
+        scored = [(self.bm_page.score(qtoks, i), i) for i in self.page_idx]
+        scored = [(min(1.0, s / BM25_FULL), i) for s, i in scored if s > 0]
+        scored.sort(key=lambda x: -x[0])
+        return [(s, self.docs[i]) for s, i in scored[:k]]
 
-        merged = gosi + pages
-        merged.sort(key=lambda x: -x[0])
-        return [(s, self.docs[i]) for s, i in merged[:topk]]
+    def search(self, q, topk=3):
+        """한 목록으로 합쳐서 보고 싶을 때(디버그·데모용)."""
+        arts = self.rank_articles(q, 2)
+        out = []
+        for _, art in arts:
+            out.extend(self.chunks_of(art, q, 2))
+        out.extend(self.rank_pages(q, 2))
+        return out[:topk] if topk else out
 
 
 if __name__ == "__main__":

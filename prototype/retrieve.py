@@ -35,10 +35,23 @@ SYN = {
 
 SUFFIX = re.compile(r"(에서는|에게서|으로서|으로|에서|에게|까지|부터|보다|처럼|라고|라는|이나|거나|에는|에도|과의|와의|은|는|이|가|을|를|의|에|로|와|과|도|만)$")
 
+# 서술어 어미 — 한국어는 '미흡하면/보완해야/필수항목인데'처럼 활용형이 붙어 색인이 갈라진다.
+ENDING = re.compile(
+    r"(하나요|까요|인가요|나요|습니까|합니다|했습니다|한다|된다|이다|하면|해야|하여|하며|하고|"
+    r"되면|되는|이며|이고|인데|이면|여야|까지|정도|경우|한|할|된|될)$"
+)
+
 
 def norm(word: str) -> str:
-    w = SUFFIX.sub("", word)
-    return w if len(w) > 1 else word
+    """어미 → 조사 순으로 최대 두 번 벗긴다. 한 글자로 줄어들면 직전 형태를 유지."""
+    w = word
+    for _ in range(2):
+        for rx in (ENDING, SUFFIX):
+            w2 = rx.sub("", w)
+            if w2 != w and len(w2) > 1:
+                w = w2
+                break
+    return w
 
 
 def tokens(text: str) -> list[str]:

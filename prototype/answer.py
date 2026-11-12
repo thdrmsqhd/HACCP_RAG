@@ -39,28 +39,18 @@ def index():
     return _U
 
 
-def retrieve(q, per_source=2, rel=0.45):
-    """근거 선별.
+def retrieve(q, per_source=2, max_articles=2):
+    """근거 선별 — 2단계.
 
-    - 고시: 1위 조문이 정해지면 **그 조문의 항을 최대 3개까지** 함께 넣는다.
-      조문 안에서 어느 항이 정답인지는 질의만으로 알 수 없고(예: 제8조 기록관리),
-      한 항만 넣으면 다른 항의 규정을 놓친다.
-    - 매뉴얼: 상위 2쪽.
+    1) 조문 단위 BM25로 후보 조문 최대 2개 (탐색형 질문에서 후보가 좁아지지 않게)
+    2) 각 조문 안에서 항 단위 BM25로 최대 2개 (숫자 규정이 여러 항에 흩어져 있어서)
+    매뉴얼은 페이지 단위 상위 2쪽.
     """
     u = index()
-    hits = u.search(q, len(u.docs))
-
-    gosi_hits = [(s, d) for s, d in hits if d["source"] == "고시"]
-    page_hits = [(s, d) for s, d in hits if d["source"] == "매뉴얼"][:per_source]
-
     picked = []
-    if gosi_hits:
-        top_s, top_d = gosi_hits[0]
-        art = top_d.get("article") or top_d["label"]
-        same = [(s, d) for s, d in gosi_hits if (d.get("article") or d["label"]) == art]
-        picked.extend(same[:3])
-
-    picked.extend(page_hits)
+    for _, art in u.rank_articles(q, max_articles):
+        picked.extend(u.chunks_of(art, q, 2))
+    picked.extend(u.rank_pages(q, per_source))
     return picked
 
 

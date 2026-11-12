@@ -21,10 +21,18 @@ def load_articles(path: str) -> list[dict]:
         num = m.group(1) + (f"의{m.group(2)}" if m.group(2) else "")
         marks.append((m.start(), num, m.group(3)))
 
+    # 같은 번호가 교차 인용으로 여러 번 잡힌다. 제목이 붙은(=실제 조문 머리) 것을 우선한다.
+    first_with_title = {}
+    for pos, num, title in marks:
+        if title and num not in first_with_title:
+            first_with_title[num] = pos
+
     arts, ptr = [], 0
     for i, (pos, num, title) in enumerate(marks):
         if ptr >= len(EXPECTED) or num != EXPECTED[ptr]:
             continue
+        if not title and num in first_with_title:
+            continue                      # 제목 없는 교차 인용은 건너뛴다
         end = len(raw)
         if ptr + 1 < len(EXPECTED):
             nxt = EXPECTED[ptr + 1]
