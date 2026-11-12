@@ -163,7 +163,7 @@ def _payload(prompt, stream):
     return json.dumps({
         "model": MODEL, "prompt": prompt, "stream": stream, "raw": False,
         "think": False, "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": 0.1, "num_predict": NUM_PREDICT},
+        "options": {"temperature": 0.0, "seed": 42, "num_predict": NUM_PREDICT},
     }).encode()
 
 
