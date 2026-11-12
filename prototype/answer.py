@@ -90,18 +90,45 @@ def retrieve(q, per_source=2, max_articles=2):
     return _drop_conflicting_manual(q, picked)
 
 
+UNIT_PATTERNS = {
+    "기간": r"\d+\s*(년|개월|일)",
+    "시간": r"\d+\s*시간",
+    "횟수": r"\d+\s*회",
+    "점수": r"\d+\s*점",
+    "비율": r"\d+\s*(?:%|퍼센트)",
+}
+
+
+def _unit_family(q: str):
+    """질문이 묻는 단위 계열. ‘언제까지’는 기간, ‘몇 시간’은 시간."""
+    if re.search(r"언제까지|며칠|몇\s*(?:년|개월|일)|기한|기간|얼마나\s*보관", q):
+        return "기간"
+    if re.search(r"몇\s*시간|시간", q):
+        return "시간"
+    if re.search(r"몇\s*회|횟수", q):
+        return "횟수"
+    if re.search(r"몇\s*점|점수", q):
+        return "점수"
+    if "%" in q or "퍼센트" in q:
+        return "비율"
+    return None
+
+
 def _snippet(text: str, q: str, limit: int = 150) -> str:
     """근거에서 질문어와 겹치는 문장만 골라 자른다.
 
     통짜로 넣으면 프롬프트가 2,000~3,000토큰이 되고, 이 모델은 프롬프트 처리도
     ~32 tok/s라 첫 질의가 60초 이상 걸린다(캐시가 없을 때).
-    수량을 묻는 질문은 숫자+단위가 들어간 문장을 우선한다(예: “연 2회 이상 기술지원”).
+    수량 질문은 **질문이 묻는 단위**의 숫자가 든 문장을 우선한다
+    (예: “언제까지” → 6개월, “몇 시간” → 16시간).
     """
     flat = " ".join(text.split())
     if len(flat) <= limit:
         return flat
     qs = {t for t in tokens(q) if len(t) > 1}
-    quantity = bool(re.search(r"몇|얼마|며칠|기한|최대|최소", q))
+    quantity = bool(re.search(r"몇|얼마|며칠|기한|최대|최소|언제까지", q))
+    family = _unit_family(q)
+    fam_re = re.compile(UNIT_PATTERNS[family]) if family else None
     # "70% 미만"처럼 숫자+부등호가 질문에 있으면 그 표현이 든 문장을 강하게 우선
     q_phrases = [re.sub(r"\s+", "", m.group(0)) for m in re.finditer(r"\d+\s*%\s*(?:미만|이상)", q)]
     sents = re.split(r"(?<=[.다])\s+", flat)
@@ -111,7 +138,9 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
         has_num = bool(NUM_UNIT.search(s))
         flat_s = re.sub(r"\s+", "", s)
         phrase_hit = sum(1 for p in q_phrases if p in flat_s)
-        score = overlap * 2 + (2 if has_num else 0) + (3 if quantity and has_num else 0) + phrase_hit * 4
+        fam_hit = 1 if (fam_re and fam_re.search(s)) else 0
+        score = (overlap * 2 + (2 if has_num else 0) + (3 if quantity and has_num else 0)
+                 + phrase_hit * 4 + fam_hit * 4)
         scored.append((score, -i, i, s))
     scored.sort(reverse=True)
     out, used = "", set()
@@ -237,7 +266,15 @@ def _generate(prompt):
 
 
 def ask_stream(q):
-    """(첫 조각 전 메타, 텍스트 조각 제너레이터)를 돌려준다. 첫 토큰까지의 지연을 줄인다."""
+    """(첫 조각 전 메타, 텍스트 조각 제너레이터)를 돌려준다.
+
+    캐시에 있으면 즉시 반환한다(스트리밍 경로도 캐시 사용).
+    """
+    key = _cache_key(q)
+    if key in _CACHE:
+        r = _CACHE[key]
+        return {"hits": r["hits"], "cache": True}, iter([r["answer"]])
+
     hits = retrieve(q)
     meta = {"hits": hits_meta(hits)}
     if not hits:
@@ -247,7 +284,7 @@ def ask_stream(q):
     def gen():
         req = urllib.request.Request(OLLAMA, data=_payload(build_prompt(q, hits), True),
                                      headers={"Content-Type": "application/json"})
-        started, buf = False, ""
+        started, acc, buf = False, "", ""
         with urllib.request.urlopen(req, timeout=240) as r:
             for line in r:
                 if not line.strip():
@@ -262,8 +299,13 @@ def ask_stream(q):
                         continue
                     buf = buf[buf.index("[설명]"):]
                     started = True
+                acc += buf
                 out, buf = buf, ""
                 yield out
+        text = _clean(acc)
+        if len(_CACHE) >= CACHE_MAX:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = {"answer": text, "hits": meta["hits"], "unsupported_numbers": []}
     return meta, gen()
 
 

@@ -32,6 +32,27 @@ def title_hit(qtoks, title_toks) -> bool:
 
 MARKS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
 NUM_UNIT = re.compile(r"\d+\s*(년|개월|일|시간|회|점|%|퍼센트|명|개)")
+FAMILY_RE = {
+    "기간": re.compile(r"\d+\s*(년|개월|일)"),
+    "시간": re.compile(r"\d+\s*시간"),
+    "횟수": re.compile(r"\d+\s*회"),
+    "점수": re.compile(r"\d+\s*점"),
+    "비율": re.compile(r"\d+\s*(?:%|퍼센트)"),
+}
+
+
+def unit_family(q: str):
+    if re.search(r"언제까지|며칠|몇\s*(?:년|개월|일)|기한|기간|얼마나\s*보관", q):
+        return "기간"
+    if re.search(r"몇\s*시간|시간", q):
+        return "시간"
+    if re.search(r"몇\s*회|횟수", q):
+        return "횟수"
+    if re.search(r"몇\s*점|점수", q):
+        return "점수"
+    if "%" in q or "퍼센트" in q:
+        return "비율"
+    return None
 
 
 def split_paragraphs(text: str) -> list[str]:
@@ -142,13 +163,17 @@ class Unified:
         """
         qtoks = tokens(q)
         idx = [i for i in self.gosi_idx if self.docs[i]["article"] == art]
-        quantity = bool(re.search(r"몇|얼마|기간|언제까지|최대|최소", q))
+        fam = unit_family(q)
+        fam_re = FAMILY_RE.get(fam) if fam else None
+        # 수량 질문이면 그 단위의 숫자가 든 항만 후보로 좁힌다.
+        # (예: “언제까지” → 6개월이 적힌 ③, “몇 시간” → 16시간이 적힌 ④)
+        if fam_re is not None:
+            with_num = [i for i in idx if fam_re.search(self.docs[i]["text"])]
+            if with_num:
+                idx = with_num
         scored = []
         for i in idx:
             s = self.bm_gosi.score(qtoks, i)
-            has_num = bool(NUM_UNIT.search(self.docs[i]["text"]))
-            if quantity and has_num:
-                s *= 1.5
             if s > 0:
                 scored.append((s, i))
         scored.sort(key=lambda x: -x[0])
