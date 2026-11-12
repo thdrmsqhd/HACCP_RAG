@@ -3,6 +3,7 @@
 LLM은 문장화만 담당하고, 근거는 반드시 검색된 출처를 인용하도록 프롬프트에서 강제한다.
 """
 import json
+import re
 import urllib.request
 
 from search_all import Unified
@@ -39,20 +40,27 @@ def index():
 
 
 def retrieve(q, per_source=2, rel=0.45):
-    """소스별 상위 k개. 단, 해당 소스 1위의 45% 미만이면 버린다(무관 근거 방지)."""
+    """근거 선별.
+
+    - 고시: 1위 조문이 정해지면 **그 조문의 항을 최대 3개까지** 함께 넣는다.
+      조문 안에서 어느 항이 정답인지는 질의만으로 알 수 없고(예: 제8조 기록관리),
+      한 항만 넣으면 다른 항의 규정을 놓친다.
+    - 매뉴얼: 상위 2쪽.
+    """
     u = index()
     hits = u.search(q, len(u.docs))
-    picked, count, top = [], {"고시": 0, "매뉴얼": 0}, {}
-    for s, d in hits:
-        src = d["source"]
-        top.setdefault(src, s)
-        if s < top[src] * rel:
-            continue
-        if count[src] < per_source:
-            picked.append((s, d))
-            count[src] += 1
-        if all(v >= per_source for v in count.values()):
-            break
+
+    gosi_hits = [(s, d) for s, d in hits if d["source"] == "고시"]
+    page_hits = [(s, d) for s, d in hits if d["source"] == "매뉴얼"][:per_source]
+
+    picked = []
+    if gosi_hits:
+        top_s, top_d = gosi_hits[0]
+        art = top_d.get("article") or top_d["label"]
+        same = [(s, d) for s, d in gosi_hits if (d.get("article") or d["label"]) == art]
+        picked.extend(same[:3])
+
+    picked.extend(page_hits)
     return picked
 
 
@@ -80,15 +88,49 @@ def hits_meta(hits):
     return [{"source": d["source"], "label": d["label"], "score": round(s, 3)} for s, d in hits]
 
 
+def _context_text(hits):
+    return " ".join(" ".join(d["text"].split()) for _, d in hits)
+
+
+NUM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(년|개월|일|시간|회|점|%|퍼센트|명|개|쪽|차)")
+
+
+def unsupported_numbers(answer_text: str, ctx: str) -> list[str]:
+    """답변에 나온 '숫자+단위' 중 근거 문장에 없는 것. 환각 탐지용."""
+    flat_ctx = re.sub(r"\s+", "", ctx)
+    out = []
+    for num, unit in NUM_RE.findall(answer_text):
+        pat = f"{num}{unit}"
+        alt = f"{num}{'퍼센트' if unit == '%' else '%' if unit == '퍼센트' else unit}"
+        if pat.replace(" ", "") not in flat_ctx and alt not in flat_ctx:
+            out.append(pat)
+    return out
+
+
+GUARD = """
+주의: 아래 [근거]에 없는 숫자는 절대 쓰지 않는다. 근거에 숫자가 없으면 "근거에 없음"이라고 쓴다.
+"""
+
+
 def ask(q):
     hits = retrieve(q)
     if not hits:
         return {"answer": "[설명] 근거를 찾지 못했습니다.\n[근거] 없음\n[다음 할 일] 질문을 업무 단계로 나눠 다시 물어보세요.", "hits": []}
-    req = urllib.request.Request(OLLAMA, data=_payload(build_prompt(q, hits), False),
+    ctx = build_prompt(q, hits)
+    text = _generate(ctx)
+    bad = unsupported_numbers(text, _context_text(hits))
+    if bad:  # 근거에 없는 수치 → 한 번 더 엄격 모드로 재생성
+        text = _generate(GUARD + ctx)
+        bad = unsupported_numbers(text, _context_text(hits))
+    return {"answer": text, "hits": hits_meta(hits), "unsupported_numbers": bad}
+
+
+def _generate(prompt):
+    req = urllib.request.Request(OLLAMA, data=_payload(prompt, False),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=240) as r:
         out = json.loads(r.read().decode())
-    return {"answer": _clean(out.get("response", "")), "hits": hits_meta(hits)}
+    return _clean(out.get("response", ""))
 
 
 def ask_stream(q):
