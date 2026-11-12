@@ -8,7 +8,7 @@ import time
 import urllib.request
 
 from retrieve import tokens
-from search_all import Unified
+from search_all import FAMILY_RE, Unified, unit_family
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "hermes-test-qwen38-9b:q4"
@@ -20,6 +20,7 @@ PROMPT = """/no_think
 아래 [근거]만 사용해 한국어로 답한다. 근거에 없는 내용은 쓰지 않는다.
 고시 조문과 평가매뉴얼의 내용이 다르면 **고시를 따른다**.
 근거에 나온 용어를 그대로 쓴다(임의로 바꿔 말하지 않는다).
+[설명]에는 **누가 무엇을 하는지**를 포함한다. “별표/조문을 확인하세요”처럼 출처만 가리키는 설명은 쓰지 않는다.
 
 출력은 정확히 아래 세 줄만 쓴다. 다른 말은 절대 쓰지 않는다.
 [설명] 쉽게 1~2문장. 120자 이내.
@@ -43,6 +44,11 @@ def index():
     if _U is None:
         _U = Unified()
     return _U
+
+
+SUBJECT_NOUNS = {"영업자", "팀장", "팀원", "종업원", "지도관", "검사관", "농업인", "영업장"}
+
+MANUAL_CUE = re.compile(r"실시상황평가표|평가항목|세부항목|현장|조도|위생복|출입구|창|유리|해충|폐기물|게시물|작업장")
 
 
 def _numbers_by_family(text: str) -> dict[str, set[str]]:
@@ -84,35 +90,18 @@ def retrieve(q, per_source=2, max_articles=2):
     매뉴얼은 페이지 단위 상위 2쪽. 고시와 숫자가 충돌하는 매뉴얼은 제외.
     """
     u = index()
-    picked = []
+    gosi, pages = [], []
     for _, art in u.rank_articles(q, max_articles):
-        picked.extend(u.chunks_of(art, q, 2))
-    picked.extend(u.rank_pages(q, per_source))
-    return _drop_conflicting_manual(q, picked)
+        gosi.extend(u.chunks_of(art, q, 2))
+    pages = u.rank_pages(q, per_source)
 
+    # 현장·평가표 용어가 질문에 있으면 매뉴얼 우선. 조문이 끼면 모델이 조문을 따라간다.
+    # 단, 조문 점수가 확실히 강하면(0.6 이상) 유지한다.
+    if gosi and pages and MANUAL_CUE.search(q):
+        if gosi[0][0] < 0.75:
+            gosi = []
 
-UNIT_PATTERNS = {
-    "기간": r"\d+\s*(년|개월|일)",
-    "시간": r"\d+\s*시간",
-    "횟수": r"\d+\s*회",
-    "점수": r"\d+\s*점",
-    "비율": r"\d+\s*(?:%|퍼센트)",
-}
-
-
-def _unit_family(q: str):
-    """질문이 묻는 단위 계열. ‘언제까지’는 기간, ‘몇 시간’은 시간."""
-    if re.search(r"언제까지|며칠|몇\s*(?:년|개월|일)|기한|기간|얼마나\s*보관", q):
-        return "기간"
-    if re.search(r"몇\s*시간|시간", q):
-        return "시간"
-    if re.search(r"몇\s*회|횟수", q):
-        return "횟수"
-    if re.search(r"몇\s*점|점수", q):
-        return "점수"
-    if "%" in q or "퍼센트" in q:
-        return "비율"
-    return None
+    return _drop_conflicting_manual(q, gosi + pages)
 
 
 def _snippet(text: str, q: str, limit: int = 150) -> str:
@@ -127,9 +116,12 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
     if len(flat) <= limit:
         return flat
     qs = {t for t in tokens(q) if len(t) > 1}
+    subjects = {t for t in qs if t in SUBJECT_NOUNS}
     quantity = bool(re.search(r"몇|얼마|며칠|기한|최대|최소|언제까지", q))
-    family = _unit_family(q)
-    fam_re = re.compile(UNIT_PATTERNS[family]) if family else None
+    if subjects:
+        limit = max(limit, 220)   # 영업자/팀장/팀원별 항목이 한 문장에 몰려 있어 잘리기 쉽다
+    family = unit_family(q)
+    fam_re = FAMILY_RE.get(family) if family else None
     # "70% 미만"처럼 숫자+부등호가 질문에 있으면 그 표현이 든 문장을 강하게 우선
     q_phrases = [re.sub(r"\s+", "", m.group(0)) for m in re.finditer(r"\d+\s*%\s*(?:미만|이상)", q)]
     sents = re.split(r"(?<=[.다])\s+", flat)
@@ -140,8 +132,9 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
         flat_s = re.sub(r"\s+", "", s)
         phrase_hit = sum(1 for p in q_phrases if p in flat_s)
         fam_hit = 1 if (fam_re and fam_re.search(s)) else 0
+        subj_hit = len(subjects & set(tokens(s)))
         score = (overlap * 2 + (2 if has_num else 0) + (3 if quantity and has_num else 0)
-                 + phrase_hit * 4 + fam_hit * 4)
+                 + phrase_hit * 4 + fam_hit * 4 + subj_hit * 5)
         scored.append((score, -i, i, s))
     scored.sort(reverse=True)
     out, used = "", set()
@@ -157,6 +150,7 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
             break
     if not out:                      # 질문어가 하나도 안 겹치면 앞부분
         out = flat[:limit]
+    out = re.sub(r"\d+$", "", out).rstrip()   # 숫자 중간에서 잘리지 않게
     return out[:limit]
 
 

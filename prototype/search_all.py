@@ -20,15 +20,27 @@ BM25_FULL = 15.0    # 매뉴얼 BM25 정규화 상한
 TITLE_BOOST = 2.0   # 질문어가 조문 제목에 걸리면 가중(예: "검증" → 제18조 감독기관의 검증기준)
 
 
-def title_hit(qtoks, title_toks) -> bool:
-    """질문어가 제목 단어에 포함되면 True (검증 ⊂ 검증기준)."""
+# 제목에 흔히 나오는 일반어는 판별력이 없어 제외한다.
+TITLE_STOP = {"안전관리인증기준", "교육훈련기관", "haccp", "기준", "등", "관리"}
+
+
+def title_ratio(qtoks, title_toks) -> float:
+    """질문어가 제목 단어를 얼마나 덮는지(0~1).
+
+    짧은 제목이 질문과 정확히 맞으면 가중이 커진다(제24조 ‘교육훈련기관 평가’ vs
+    제23의2조 ‘교육훈련기관의 강사전문성 평가 등’).
+    """
+    cand = [t for t in title_toks if t not in TITLE_STOP]
+    if not cand:
+        return 0.0
+    hit = set()
     for q in qtoks:
-        if len(q) < 2:
+        if len(q) < 2 or q in TITLE_STOP:
             continue
-        for t in title_toks:
-            if q in t:
-                return True
-    return False
+        for t in cand:
+            if q in t or t in q:
+                hit.add(t)
+    return len(hit) / len(cand)
 
 MARKS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
 NUM_UNIT = re.compile(r"\d+\s*(년|개월|일|시간|회|점|%|퍼센트|명|개)")
@@ -64,6 +76,31 @@ def query_tokens(q: str) -> list[str]:
             if k in t:
                 out.extend(v for v in vs if v not in out)
     return out
+
+
+# 질문 유형 — 같은 조문 안에서 어느 항이 답인지가 유형에 따라 달라진다.
+ACTOR_RE = re.compile(r"식품의약품안전처장|한국식품안전관리인증원장|지방식품의약품안전청장|농림축산식품부장관|영업자|농업인")
+PROC_RE = re.compile(r"신청|제출|심사|조사|평가|명할 수 있|요구할 수 있|통보|지정")
+REQ_RE = re.compile(r"요건|기준|갖추|구비|설치|수립")
+
+
+ACTION_RE = re.compile(r"명할 수 있|시정명령|인증을 취소|개선하도록|보완하도록")
+
+
+def question_type(q: str) -> str:
+    if re.search(r"몇|얼마|며칠|언제까지|기한|최대|최소", q):
+        return "기한"
+    if re.search(r"어떻게|절차|방법|신청", q):
+        return "절차"
+    if re.search(r"조치|받나요|받게 되나요", q):
+        return "조치"
+    if re.search(r"누가|누구|어느 기관|담당|주체", q):
+        return "주체"
+    if re.search(r"요건|기준|갖추|필요한", q):
+        return "요건"
+    if re.search(r"무엇인가요|란\?|정의", q):
+        return "정의"
+    return "일반"
 
 
 def unit_family(q: str):
@@ -170,11 +207,19 @@ class Unified:
     def rank_articles(self, q, k=2):
         """조문 단위 BM25로 후보 조문을 고른다."""
         qtoks = query_tokens(q)
+        qtype = question_type(q)
+        # 제목 가중은 절차·조치·주체·요건형에서만. 수치·기한형에 걸면
+        # 엉뚱한 조문(예: 실시상황평가표 5점 → 제11조)이 올라온다.
+        use_title = qtype in ("절차", "조치", "주체", "요건")
+        fam = unit_family(q)
+        fam_re = FAMILY_RE.get(fam) if fam else None
         scored = []
         for i, d in enumerate(self.art_docs):
             s = self.bm_art.score(qtoks, i)
-            if s > 0 and title_hit(qtoks, d["title_toks"]):
-                s *= TITLE_BOOST
+            if s > 0 and use_title:
+                s *= 1 + TITLE_BOOST * title_ratio(qtoks, d["title_toks"])
+            if s > 0 and fam_re is not None and fam_re.search(" ".join(self.art_text[d["article"]])):
+                s *= 1.5          # 질문이 묻는 단위의 숫자가 있는 조문 우선
             if s > 0:
                 scored.append((s, i))
         scored.sort(key=lambda x: -x[0])
@@ -190,15 +235,27 @@ class Unified:
         idx = [i for i in self.gosi_idx if self.docs[i]["article"] == art]
         fam = unit_family(q)
         fam_re = FAMILY_RE.get(fam) if fam else None
+        qtype = question_type(q)
         # 수량 질문이면 그 단위의 숫자가 든 항만 후보로 좁힌다.
         # (예: “언제까지” → 6개월이 적힌 ③, “몇 시간” → 16시간이 적힌 ④)
         if fam_re is not None:
             with_num = [i for i in idx if fam_re.search(self.docs[i]["text"])]
             if with_num:
                 idx = with_num
+        pref = {"주체": ACTOR_RE, "절차": PROC_RE, "요건": REQ_RE}.get(qtype)
         scored = []
         for i in idx:
             s = self.bm_gosi.score(qtoks, i)
+            text = self.docs[i]["text"]
+            if pref is not None and pref.search(text):
+                s *= 1.4                     # 유형에 맞는 항 우선
+            if qtype == "조치":
+                # “어떤 조치를 받나요” → 업소에 대한 조치(시정명령·인증취소) 항.
+                # 원장의 ‘통보 의무’ 항은 주체가 달라 오답을 만든다.
+                if ACTION_RE.search(text):
+                    s *= 1.8
+                elif "통보" in text and not ACTION_RE.search(text):
+                    s *= 0.7
             if s > 0:
                 scored.append((s, i))
         scored.sort(key=lambda x: -x[0])
