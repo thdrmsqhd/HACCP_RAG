@@ -21,6 +21,9 @@ TITLE_BOOST = 2.0   # 질문어가 조문 제목에 걸리면 가중(예: "검�
 
 
 # 제목에 흔히 나오는 일반어는 판별력이 없어 제외한다.
+# 우선순위: 질문의 ‘행위’를 가장 잘 나타내는 말부터
+ACTION_TERMS = ("신청", "변경", "반납", "취소", "등록", "평가", "지정")
+
 TITLE_STOP = {"안전관리인증기준", "교육훈련기관", "haccp", "기준", "등", "관리"}
 
 
@@ -218,6 +221,11 @@ class Unified:
             s = self.bm_art.score(qtoks, i)
             if s > 0 and use_title:
                 s *= 1 + TITLE_BOOST * title_ratio(qtoks, d["title_toks"])
+                # 질문의 행위어(신청·변경·취소·지정·등록)가 제목에 있으면 우선
+                # (예: “어떻게 신청” → 제21조 지정신청, “변경하려면” → 제12조 변경)
+                act = next((t for t in ACTION_TERMS if t in q), None)
+                if act and any(act in t for t in d["title_toks"]):
+                    s *= 1.4
             if s > 0 and fam_re is not None and fam_re.search(" ".join(self.art_text[d["article"]])):
                 s *= 1.5          # 질문이 묻는 단위의 숫자가 있는 조문 우선
             if s > 0:
@@ -249,6 +257,13 @@ class Unified:
             text = self.docs[i]["text"]
             if pref is not None and pref.search(text):
                 s *= 1.4                     # 유형에 맞는 항 우선
+            if qtype == "요건" and re.search(r"각 호|요건|기준|갖추", text):
+                s *= 1.5
+            if qtype == "절차":
+                if re.search(r"신청서|제출", text):
+                    s *= 1.6                  # “어떻게 신청” → 신청서 제출 항
+                elif re.search(r"심사|평가", text):
+                    s *= 1.1
             if qtype == "조치":
                 # “어떤 조치를 받나요” → 업소에 대한 조치(시정명령·인증취소) 항.
                 # 원장의 ‘통보 의무’ 항은 주체가 달라 오답을 만든다.
