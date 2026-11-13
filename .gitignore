@@ -16,3 +16,6 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# 인증원 대용량 원본
+corpus/01_공개자료/인증원/*.pdf
