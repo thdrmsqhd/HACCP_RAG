@@ -15,6 +15,7 @@ MODEL = "hermes-test-qwen38-9b:q4"
 KEEP_ALIVE = "30m"          # 모델 언로드로 인한 30~40초 콜드스타트 방지
 NUM_PREDICT = 110           # 3줄 답변 목표. 길게 쓰면 느려지고 잘린다
 NUM_PREDICT_LIST = 200      # G1: 요건·절차·주체형은 항목 나열. 260에서 200으로(항목당 한 줄)
+DEF_LIMIT = 600            # 정의형 질문의 정의 문단 길이
 MANUAL_LIST_LIMIT = 300     # 속도: 나열형이어도 매뉴얼(OCR)은 질문어 문장만 압축. 고시는 항 전체
 FULL_LIMIT = 900            # A2: 나열형은 근거를 압축하지 않고 항 전체(근거당 상한)
 LIST_TYPES = {"절차", "요건", "주체", "조치"}
@@ -141,7 +142,7 @@ def retrieve(q, per_source=2, max_articles=2):
         refs = [re.sub(r"\s+", "", r) for r in BYL_REF.findall(d["text"])]
         art = next((f"별표{r}" for r in refs if f"별표{r}" in u.art_text), None)
         if art and art not in have:
-            gosi.extend(u.chunks_of(art, q, 1))
+            gosi.extend(u.best_annex_chunk(art, q))
             have.add(art)
             break
     for sc, d in u.action_annex(q):                 # A4
@@ -179,6 +180,9 @@ def _snippet(text: str, q: str, limit: int = 150, source: str = "고시") -> str
         limit = max(limit, MANUAL_LIST_LIMIT)   # 매뉴얼은 압축(프롬프트 처리 시간이 길이에 비례)
     if len(flat) <= limit:
         return flat
+    # 정의형: “가. ○○이란 …을 말한다” 같은 정의 문단은 문장 단위 압축이 번호만 남긴다 → 앞부분 통째로
+    if question_type(q) == "정의" and source == "고시" and re.search(r"(?:이)?란\s.{0,200}말한다", flat):
+        return flat[:DEF_LIMIT]
     qs = {t for t in tokens(q) if len(t) > 1}
     subjects = {t for t in qs if t in SUBJECT_NOUNS}
     quantity = bool(re.search(r"몇|얼마|며칠|기한|최대|최소|언제까지", q))
@@ -257,7 +261,7 @@ def _clean(raw: str) -> str:
     return "\n".join(out).strip()
 
 
-ITEM_PREFIX = re.compile(r"^(\s*-\s*)항목\s*\d+\s*[:：]\s*", re.M)
+ITEM_PREFIX = re.compile(r"^(\s*-\s*)항목\s*\d+\s*(?:[:：]\s*|\n\s*)", re.M)   # “- 항목 1:” / “- 항목 1⏎본문”
 
 
 def _cite_label(d) -> str:

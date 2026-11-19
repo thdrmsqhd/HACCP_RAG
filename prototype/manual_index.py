@@ -21,6 +21,10 @@ def clean(text: str) -> str:
     for a, b in FIXES:
         text = text.replace(a, b)
     text = text.replace("수칙올", "수칙을").replace("확인올", "확인을")
+    # 평가 등급 범례(5점 모두 만족 / 4점 만족 / 3점 일부 미흡 / 2점 미흡 / 1점 이하 재검토)
+    text = re.sub(r"(점\s*모두\s*)민족", r"\1만족", text)
+    text = re.sub(r"(\d점\s*(?:일부\s*)?)미[혼음롭움습급]", r"\1미흡", text)
+    text = text.replace("구점 이하 재검토", "1점 이하 재검토")
     text = re.sub(r"올(?=\s)", "을", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)

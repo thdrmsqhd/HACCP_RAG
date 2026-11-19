@@ -178,7 +178,10 @@ def split_paragraphs(text: str) -> list[str]:
         parts.append(text[start:end].strip())
     head = text[: idx[0]].strip()
     if head:
-        parts.insert(0, head)
+        if re.fullmatch(r"제\d+조(?:의\d+)?\s*\([^)]*\)", head):
+            parts[0] = head + " " + parts[0]      # 제목만 있는 머리는 ①항에 붙인다
+        else:
+            parts.insert(0, head)
     return parts
 
 
@@ -306,6 +309,31 @@ class Unified:
         scored.sort(key=lambda x: -x[0])
         return [(min(1.0, s / GOSI_FULL), self.docs[i]) for s, i in scored[:k] if s > 0]
 
+    def best_annex_chunk(self, art, q):
+        """별표 안에서 조각 1개. BM25 점수가 비슷하면 질문의 드문 단어(예: 조도·육안)를
+        더 많이 담은 조각을 고른다. (요건형 ‘기준’ 가중이 엉뚱한 ‘검사기준’ 조각을 올리던 문제)"""
+        qtoks = list(dict.fromkeys(tokens(q)))
+        idf = self.bm_gosi.idf
+        total = sum(idf.get(t, 0) for t in qtoks) or 1.0
+        best = None
+        for i in self.gosi_idx:
+            d = self.docs[i]
+            if d["article"] != art:
+                continue
+            bm = self.bm_gosi.score(qtoks, i)
+            if bm <= 0:
+                continue
+            cover = sum(idf.get(t, 0) for t in qtoks if t in d["toks"]) / total
+            s = bm * (0.5 + cover)
+            is_def = bool(re.search(r"용어의 정의|(?:이)?란\s.{0,200}말한다", d["text"]))
+            if question_type(q) == "정의":
+                s *= 2.0 if is_def else 1.0   # “○○이란” → 목적·용어 정의 조각
+            elif is_def:
+                s *= 0.5                      # 요건·절차 질문에 용어 정의 조각이 끼지 않게
+            if best is None or s > best[0]:
+                best = (s, i)
+        return [(min(1.0, best[0] / GOSI_FULL), self.docs[best[1]])] if best else []
+
     def chunks_of(self, art, q, k=2):
         """한 조문 안에서 질의에 맞는 항을 고른다.
 
@@ -337,6 +365,8 @@ class Unified:
                     s *= 1.6                  # “어떻게 신청” → 신청서 제출 항
                 elif re.search(r"심사|평가", text):
                     s *= 1.1
+            if qtype == "정의" and re.search(r"(?:이)?란\s|말한다|목적", text):
+                s *= 2.0                      # “○○이란 무엇” → 용어 정의·목적 조각
             if qtype == "조치":
                 # “어떤 조치를 받나요” → 업소에 대한 조치(시정명령·인증취소) 항.
                 # 원장의 ‘통보 의무’ 항은 주체가 달라 오답을 만든다.
