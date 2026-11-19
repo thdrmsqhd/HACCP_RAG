@@ -19,3 +19,7 @@ Thumbs.db
 
 # 인증원 대용량 원본
 corpus/01_공개자료/인증원/*.pdf
+
+# 회사 제출용 문서(비공개 보관: ../HACCP_RAG_비공개)
+제안서_HACCP_RAG.md
+제안서_HACCP_RAG.pdf
