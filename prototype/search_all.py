@@ -17,7 +17,7 @@ from manual_index import OCR_DIR, load_pages
 
 # 매뉴얼 검색 단위. "items" = 미리 구조화한 평가항목(manual_items.py 결과) + 항목에 안 걸린 쪽,
 # "pages" = 쪽 단위(이전 방식). 환경변수 HACCP_MANUAL_MODE로 바꿔 비교할 수 있다.
-MANUAL_MODE = os.environ.get("HACCP_MANUAL_MODE", "pages")  # items: 검색 적중 동일(14/16), 답변 측정 전이라 기본값은 pages
+MANUAL_MODE = os.environ.get("HACCP_MANUAL_MODE", "items")  # 홀드아웃 정답 동일(9/15), 무관 근거 혼입 감소 → 기본값 items
 MANUAL_ITEMS = OCR_DIR / "manual_items.jsonl"
 
 
