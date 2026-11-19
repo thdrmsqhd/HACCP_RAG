@@ -19,6 +19,23 @@ from manual_index import OCR_DIR, load_pages
 # "pages" = 쪽 단위(이전 방식). 환경변수 HACCP_MANUAL_MODE로 바꿔 비교할 수 있다.
 MANUAL_MODE = os.environ.get("HACCP_MANUAL_MODE", "items")  # 홀드아웃 정답 동일(9/15), 무관 근거 혼입 감소 → 기본값 items
 MANUAL_ITEMS = OCR_DIR / "manual_items.jsonl"
+# A1: 고시 별표 본문(byl_text.py 결과). 고시와 같은 법령 근거로 검색한다.
+BYL_CHUNKS = OCR_DIR.parent / "별표" / "byl_chunks.jsonl"
+USE_BYL = os.environ.get("HACCP_USE_BYL", "1") == "1"
+BYL_REF = re.compile(r"별표\s*(\d+(?:\s*의\s*\d+)?)")
+
+
+def byl_docs():
+    if not USE_BYL or not BYL_CHUNKS.exists():
+        return []
+    out = []
+    for l in BYL_CHUNKS.open(encoding="utf-8"):
+        r = json.loads(l)
+        art = f"별표{r['byl']}"
+        out.append({"source": "고시", "label": f"별표 {r['byl']}({r['title']}) {r['part']}",
+                    "article": art, "art_title": r["title"], "text": r["text"],
+                    "toks_src": f"별표 {r['byl']} {r['title']} " + r["text"]})
+    return out
 
 
 def manual_docs():
@@ -52,6 +69,7 @@ TITLE_BOOST = 2.0   # 질문어가 조문 제목에 걸리면 가중(예: "검�
 # 제목에 흔히 나오는 일반어는 판별력이 없어 제외한다.
 # 우선순위: 질문의 ‘행위’를 가장 잘 나타내는 말부터
 ACTION_TERMS = ("신청", "변경", "반납", "취소", "등록", "평가", "지정")
+STRONG_ACTIONS = ("취소", "반납")
 
 TITLE_STOP = {"안전관리인증기준", "교육훈련기관", "haccp", "기준", "등", "관리"}
 
@@ -211,6 +229,9 @@ class Unified:
                     "text": body,
                     "toks": tokens(f"제{a['num']}조 {a['title']} " + body),
                 })
+        for d in byl_docs():
+            d["toks"] = tokens(d["toks_src"])
+            self.docs.append(d)
         for d in manual_docs():
             d["toks"] = tokens(d["toks_src"])
             self.docs.append(d)
@@ -226,9 +247,14 @@ class Unified:
             a = self.docs[i]["article"]
             self.art_text.setdefault(a, []).append(self.docs[i]["text"])
         titles = {f"제{a['num']}조": a["title"] for a in load_articles(GOSI)}
+        titles.update({self.docs[i]["article"]: self.docs[i]["art_title"]
+                       for i in self.gosi_idx if "art_title" in self.docs[i]})
+        # 별표는 조문 후보 경쟁에 넣지 않는다(넣으면 선행요건 별표 1이 매뉴얼 질문까지 끌어온다).
+        # 별표는 조문이 가리킬 때(A3)와 취소·반납 질문(A4)에서만 붙인다 → answer.retrieve
         self.art_docs = [{"article": a,
                           "toks": tokens(" ".join(t)),
-                          "title_toks": tokens(titles.get(a, ""))} for a, t in self.art_text.items()]
+                          "title_toks": tokens(titles.get(a, ""))} for a, t in self.art_text.items()
+                         if not a.startswith("별표")]
         self.bm_art = _BM25(self.art_docs, list(range(len(self.art_docs))))
 
     def rank_articles(self, q, k=2):
@@ -250,12 +276,35 @@ class Unified:
                 act = next((t for t in ACTION_TERMS if t in q), None)
                 if act and any(act in t for t in d["title_toks"]):
                     s *= 1.4
+                # A4: 취소·반납은 조문 제목에 잘 안 나온다. 질문의 대상어와 행위어가 본문에 함께 있으면 우선.
+                if act in STRONG_ACTIONS:
+                    body = " ".join(self.art_text[d["article"]])
+                    if act in body and any(t in body for t in tokens(q) if len(t) >= 4):
+                        s *= 1.6
             if s > 0 and fam_re is not None and fam_re.search(" ".join(self.art_text[d["article"]])):
                 s *= 1.5          # 질문이 묻는 단위의 숫자가 있는 조문 우선
             if s > 0:
                 scored.append((s, i))
         scored.sort(key=lambda x: -x[0])
         return [(s, self.art_docs[i]["article"]) for s, i in scored[:k]]
+
+    def action_annex(self, q, k=1):
+        """A4: 취소·반납 질문 → 행위어와 대상어(4글자 이상 질문어)가 함께 든 별표 조각."""
+        act = next((t for t in STRONG_ACTIONS if t in q), None)
+        if not act:
+            return []
+        targets = [t for t in tokens(q) if len(t) >= 4]
+        qtoks = tokens(q)
+        scored = []
+        for i in self.gosi_idx:
+            d = self.docs[i]
+            if not d["article"].startswith("별표") or act not in d["text"]:
+                continue
+            if not any(t in d["text"] for t in targets):
+                continue
+            scored.append((self.bm_gosi.score(qtoks, i), i))
+        scored.sort(key=lambda x: -x[0])
+        return [(min(1.0, s / GOSI_FULL), self.docs[i]) for s, i in scored[:k] if s > 0]
 
     def chunks_of(self, art, q, k=2):
         """한 조문 안에서 질의에 맞는 항을 고른다.

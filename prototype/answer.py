@@ -8,7 +8,7 @@ import time
 import urllib.request
 
 from retrieve import tokens
-from search_all import FAMILY_RE, Unified, question_type, unit_family
+from search_all import BYL_REF, FAMILY_RE, Unified, question_type, unit_family
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "hermes-test-qwen38-9b:q4"
@@ -130,6 +130,24 @@ def retrieve(q, per_source=2, max_articles=2):
         gosi.extend(u.chunks_of(art, q, 2))
     pages = u.rank_pages(q, per_source)
 
+    # A3: 고른 조문이 “별표 N”을 가리키면 그 별표에서 질문에 맞는 조각을 붙인다.
+    # (예: 제6조의2 “별표 4의3의 요건을 준수” → 별표 4의3 본문)
+    # 별표는 최대 1개만 붙인다. 제28조(재검토기한)는 별표를 목록으로만 나열하므로 제외.
+    have = {d["article"] for _, d in gosi}
+    for _, d in list(gosi):
+        if d["article"] == "제28조":
+            continue
+        refs = [re.sub(r"\s+", "", r) for r in BYL_REF.findall(d["text"])]
+        art = next((f"별표{r}" for r in refs if f"별표{r}" in u.art_text), None)
+        if art and art not in have:
+            gosi.extend(u.chunks_of(art, q, 1))
+            have.add(art)
+            break
+    for sc, d in u.action_annex(q):                 # A4
+        if d["article"] not in have:
+            gosi.append((sc, d))
+            have.add(d["article"])
+
     # 현장·평가표 용어가 질문에 있으면 매뉴얼 우선. 조문이 끼면 모델이 조문을 따라간다.
     # 단, 조문 점수가 확실히 강하면(0.6 이상) 유지한다.
     if gosi and pages and MANUAL_CUE.search(q):
@@ -150,6 +168,12 @@ def _snippet(text: str, q: str, limit: int = 150, source: str = "고시") -> str
     flat = " ".join(text.split())
     if is_list_q(q):
         if source == "고시":         # A2: 나열형 고시는 항 전체(압축하면 항목이 잘린다)
+            if len(flat) > FULL_LIMIT:
+                # 긴 별표 조각: 취소·반납 같은 행위어가 뒤쪽에 있으면 그 주변을 넘긴다
+                act = next((t for t in ("취소", "반납") if t in q and t in flat), None)
+                if act:
+                    st = max(0, flat.find(act) - FULL_LIMIT // 2)
+                    return flat[st:st + FULL_LIMIT]
             return flat[:FULL_LIMIT]
         limit = max(limit, MANUAL_LIST_LIMIT)   # 매뉴얼은 압축(프롬프트 처리 시간이 길이에 비례)
     if len(flat) <= limit:
@@ -238,6 +262,8 @@ ITEM_PREFIX = re.compile(r"^(\s*-\s*)항목\s*\d+\s*[:：]\s*", re.M)
 def _cite_label(d) -> str:
     """검색 결과에서 출처 이름만 뽑는다. 예: 고시 제9조 / 평가매뉴얼 p.432"""
     if d["source"] == "고시":
+        if d["label"].startswith("별표"):
+            return "고시 " + d["label"].split("(")[0]
         m = re.match(r"(제[\d의]+조)", d["label"])
         return "고시 " + (m.group(1) if m else d["label"][:12])
     return d["label"]
