@@ -5,13 +5,42 @@
 - 두 소스 모두 BM25. 소스별로 IDF를 따로 계산해 점수를 섞지 않는다.
 - 조문은 **질문 용어 포함률 0.34 이상**일 때만 근거로 인정한다(무관 조문 차단).
 """
+import json
 import math
+import os
 import re
 import sys
 from collections import Counter
 
 from corpus import load_articles
-from manual_index import load_pages
+from manual_index import OCR_DIR, load_pages
+
+# 매뉴얼 검색 단위. "items" = 미리 구조화한 평가항목(manual_items.py 결과) + 항목에 안 걸린 쪽,
+# "pages" = 쪽 단위(이전 방식). 환경변수 HACCP_MANUAL_MODE로 바꿔 비교할 수 있다.
+MANUAL_MODE = os.environ.get("HACCP_MANUAL_MODE", "pages")  # items: 검색 적중 동일(14/16), 답변 측정 전이라 기본값은 pages
+MANUAL_ITEMS = OCR_DIR / "manual_items.jsonl"
+
+
+def manual_docs():
+    pages = load_pages()
+    if MANUAL_MODE != "items" or not MANUAL_ITEMS.exists():
+        return [{"source": "매뉴얼", "label": f"평가매뉴얼 p.{p['page']}", "article": "",
+                 "text": p["text"], "toks_src": p["text"]} for p in pages]
+    items = [json.loads(l) for l in MANUAL_ITEMS.open(encoding="utf-8")]
+    covered = {n for it in items for n in range(it["page_start"], it["page_end"] + 1)}
+    out = []
+    for it in items:
+        head = f'{it["topic"]} {it["title"]}'.strip()
+        pg = it["page_start"] if it["page_start"] == it["page_end"] else f'{it["page_start"]}-{it["page_end"]}'
+        out.append({"source": "매뉴얼", "label": f"평가매뉴얼 p.{pg}", "article": it["id"],
+                    "text": head + "\n" + it["text"],
+                    # 항목 제목은 검색에서 두 번 센다(본문보다 질문과 직접 맞닿는 문장)
+                    "toks_src": head + " " + head + " " + it["text"]})
+    for p in pages:                      # 개요·절차 등 항목이 없는 쪽은 쪽 단위로 남긴다
+        if p["page"] not in covered:
+            out.append({"source": "매뉴얼", "label": f"평가매뉴얼 p.{p['page']}", "article": "",
+                        "text": p["text"], "toks_src": p["text"]})
+    return out
 from retrieve import GOSI, tokens
 
 K1, B = 1.5, 0.75
@@ -182,14 +211,9 @@ class Unified:
                     "text": body,
                     "toks": tokens(f"제{a['num']}조 {a['title']} " + body),
                 })
-        for p in load_pages():
-            self.docs.append({
-                "source": "매뉴얼",
-                "label": f"평가매뉴얼 p.{p['page']}",
-                "article": "",
-                "text": p["text"],
-                "toks": tokens(p["text"]),
-            })
+        for d in manual_docs():
+            d["toks"] = tokens(d["toks_src"])
+            self.docs.append(d)
 
         self.gosi_idx = [i for i, d in enumerate(self.docs) if d["source"] == "고시"]
         self.page_idx = [i for i, d in enumerate(self.docs) if d["source"] == "매뉴얼"]

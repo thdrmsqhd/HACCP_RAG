@@ -14,7 +14,8 @@ OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "hermes-test-qwen38-9b:q4"
 KEEP_ALIVE = "30m"          # 모델 언로드로 인한 30~40초 콜드스타트 방지
 NUM_PREDICT = 110           # 3줄 답변 목표. 길게 쓰면 느려지고 잘린다
-NUM_PREDICT_LIST = 260      # G1: 요건·절차·주체형은 항목 나열이 답이라 길게 허용
+NUM_PREDICT_LIST = 200      # G1: 요건·절차·주체형은 항목 나열. 260에서 200으로(항목당 한 줄)
+MANUAL_LIST_LIMIT = 300     # 속도: 나열형이어도 매뉴얼(OCR)은 질문어 문장만 압축. 고시는 항 전체
 FULL_LIMIT = 900            # A2: 나열형은 근거를 압축하지 않고 항 전체(근거당 상한)
 LIST_TYPES = {"절차", "요건", "주체", "조치"}
 LIST_CUE = re.compile(r"무엇이 있|어떤 사항|무슨 일|구성|책무|경우|요건")
@@ -50,7 +51,7 @@ PROMPT_LIST = """/no_think
 아래 [근거]만 사용해 한국어로 답한다. 근거에 없는 내용은 쓰지 않는다.
 고시 조문과 평가매뉴얼의 내용이 다르면 **고시를 따른다**.
 근거에 나온 용어를 그대로 쓴다(임의로 바꿔 말하지 않는다).
-이 질문은 항목을 나열해야 답이 되는 질문이다. 근거에 적힌 항목(호·목·요건·절차 단계)을 빠짐없이, 최대 5개까지 쓴다.
+이 질문은 항목을 나열해야 답이 되는 질문이다. 근거에 적힌 항목(호·목·요건·절차 단계)을 빠짐없이, 최대 5개까지 쓴다. 각 항목은 한 문장, 60자 안팎으로 짧게 쓴다.
 각 항목에는 **누가 무엇을 하는지**를 쓴다. “별표/조문을 확인하세요”처럼 출처만 가리키는 항목은 쓰지 않는다.
 
 출력은 정확히 아래 형식만 쓴다. 다른 말은 절대 쓰지 않는다.
@@ -138,7 +139,7 @@ def retrieve(q, per_source=2, max_articles=2):
     return _drop_conflicting_manual(q, gosi + pages)
 
 
-def _snippet(text: str, q: str, limit: int = 150) -> str:
+def _snippet(text: str, q: str, limit: int = 150, source: str = "고시") -> str:
     """근거에서 질문어와 겹치는 문장만 골라 자른다.
 
     통짜로 넣으면 프롬프트가 2,000~3,000토큰이 되고, 이 모델은 프롬프트 처리도
@@ -147,8 +148,10 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
     (예: “언제까지” → 6개월, “몇 시간” → 16시간).
     """
     flat = " ".join(text.split())
-    if is_list_q(q):                 # A2: 나열형은 항 전체를 넘긴다(압축하면 항목이 잘린다)
-        return flat[:FULL_LIMIT]
+    if is_list_q(q):
+        if source == "고시":         # A2: 나열형 고시는 항 전체(압축하면 항목이 잘린다)
+            return flat[:FULL_LIMIT]
+        limit = max(limit, MANUAL_LIST_LIMIT)   # 매뉴얼은 압축(프롬프트 처리 시간이 길이에 비례)
     if len(flat) <= limit:
         return flat
     qs = {t for t in tokens(q) if len(t) > 1}
@@ -193,14 +196,14 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
 
 
 def build_prompt(q, hits):
-    ctx = "\n".join(f"- ({d['source']} {d['label']}) " + _snippet(d["text"], q) for _, d in hits)
+    ctx = "\n".join(f"- ({d['source']} {d['label']}) " + _snippet(d["text"], q, source=d["source"]) for _, d in hits)
     return (PROMPT_LIST if is_list_q(q) else PROMPT).format(q=q, ctx=ctx)
 
 
 def context_coverage(q, hits):
     """E1: 검색된 원문 길이 대비 모델에 전달된 길이."""
     full = sum(len(" ".join(d["text"].split())) for _, d in hits)
-    seen = sum(len(_snippet(d["text"], q)) for _, d in hits)
+    seen = sum(len(_snippet(d["text"], q, source=d["source"])) for _, d in hits)
     return {"full_chars": full, "seen_chars": seen, "pct": round(100 * seen / full) if full else 0}
 
 
