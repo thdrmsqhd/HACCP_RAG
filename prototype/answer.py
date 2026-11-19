@@ -8,7 +8,7 @@ import time
 import urllib.request
 
 from retrieve import tokens
-from search_all import BYL_REF, FAMILY_RE, Unified, question_type, unit_family
+from search_all import BYL_REF, FORM_CUE, FORM_REF, FAMILY_RE, Unified, question_type, unit_family
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "hermes-test-qwen38-9b:q4"
@@ -145,6 +145,16 @@ def retrieve(q, per_source=2, max_articles=2):
             gosi.extend(u.best_annex_chunk(art, q))
             have.add(art)
             break
+    # 서식: 조문이 “별지 제N호서식”을 가리키고, 질문이 그 서식 대상을 물을 때만(예: 인증서에 적히는 사항)
+    for _, d in list(gosi):
+        for no in dict.fromkeys(FORM_REF.findall(d["text"])):
+            art = f"서식{no}"
+            cue = FORM_CUE.get(no)
+            if art in have or art not in u.art_text or not (cue and cue.search(q)):
+                continue
+            fd = next(x for x in u.docs if x["article"] == art)
+            gosi.append((1.0, fd))
+            have.add(art)
     for sc, d in u.action_annex(q):                 # A4
         if d["article"] not in have:
             gosi.append((sc, d))
@@ -269,6 +279,8 @@ def _cite_label(d) -> str:
     if d["source"] == "고시":
         if d["label"].startswith("별표"):
             return "고시 " + d["label"].split("(")[0]
+        if d["label"].startswith("시행규칙"):
+            return "식품위생법 " + d["label"].split("(")[0]
         m = re.match(r"(제[\d의]+조)", d["label"])
         return "고시 " + (m.group(1) if m else d["label"][:12])
     return d["label"]

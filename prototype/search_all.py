@@ -25,6 +25,24 @@ USE_BYL = os.environ.get("HACCP_USE_BYL", "1") == "1"
 BYL_REF = re.compile(r"별표\s*(\d+(?:\s*의\s*\d+)?)")
 
 
+FORM_CHUNKS = OCR_DIR.parent / "서식" / "form_chunks.jsonl"
+FORM_REF = re.compile(r"별지\s*제(\d+)호서식")
+# 서식은 질문이 그 서식 자체를 물을 때만 붙인다(인증서 기재사항 등). 조문마다 붙이면 잡음이 된다.
+FORM_CUE = {"53": re.compile(r"인증서(?:에|의)\s*(?:는\s*)?(?:어떤|무엇|무슨)|기재|적히|적는"), "54": re.compile(r"변경\s*신청서|서식")}
+
+
+def form_docs():
+    if not USE_BYL or not FORM_CHUNKS.exists():
+        return []
+    out = []
+    for l in FORM_CHUNKS.open(encoding="utf-8"):
+        r = json.loads(l)
+        out.append({"source": "고시", "label": f"시행규칙 별지 제{r['form']}호서식({r['title']})",
+                    "article": f"서식{r['form']}", "art_title": r["title"], "text": r["text"],
+                    "toks_src": f"별지 제{r['form']}호서식 {r['title']} " + r["text"]})
+    return out
+
+
 def byl_docs():
     if not USE_BYL or not BYL_CHUNKS.exists():
         return []
@@ -232,7 +250,7 @@ class Unified:
                     "text": body,
                     "toks": tokens(f"제{a['num']}조 {a['title']} " + body),
                 })
-        for d in byl_docs():
+        for d in byl_docs() + form_docs():
             d["toks"] = tokens(d["toks_src"])
             self.docs.append(d)
         for d in manual_docs():
@@ -257,7 +275,7 @@ class Unified:
         self.art_docs = [{"article": a,
                           "toks": tokens(" ".join(t)),
                           "title_toks": tokens(titles.get(a, ""))} for a, t in self.art_text.items()
-                         if not a.startswith("별표")]
+                         if not a.startswith(("별표", "서식"))]
         self.bm_art = _BM25(self.art_docs, list(range(len(self.art_docs))))
 
     def rank_articles(self, q, k=2):
