@@ -9,7 +9,9 @@ import time
 
 import answer
 
-OUT = pathlib.Path(__file__).with_name("answer_holdout2_results.jsonl")
+import sys
+TAG = sys.argv[1] if len(sys.argv) > 1 else ""
+OUT = pathlib.Path(__file__).with_name(f"answer_holdout2_results{TAG}.jsonl")
 
 QUESTIONS = [
     "HACCP 팀장의 책무는 무엇인가요?",
@@ -38,6 +40,7 @@ def main():
             r = answer.ask(q)
             row = {"q": q, "answer": r["answer"],
                    "hits": [(h["source"], h["label"]) for h in r["hits"]],
+                   "coverage": r.get("coverage"),
                    "sec": round(time.time() - t0, 1)}
             rows.append(row)
             f.write(json.dumps(row, ensure_ascii=False) + "\n")

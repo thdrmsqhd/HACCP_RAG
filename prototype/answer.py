@@ -8,12 +8,23 @@ import time
 import urllib.request
 
 from retrieve import tokens
-from search_all import FAMILY_RE, Unified, unit_family
+from search_all import FAMILY_RE, Unified, question_type, unit_family
 
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 MODEL = "hermes-test-qwen38-9b:q4"
 KEEP_ALIVE = "30m"          # 모델 언로드로 인한 30~40초 콜드스타트 방지
 NUM_PREDICT = 110           # 3줄 답변 목표. 길게 쓰면 느려지고 잘린다
+NUM_PREDICT_LIST = 260      # G1: 요건·절차·주체형은 항목 나열이 답이라 길게 허용
+FULL_LIMIT = 900            # A2: 나열형은 근거를 압축하지 않고 항 전체(근거당 상한)
+LIST_TYPES = {"절차", "요건", "주체", "조치"}
+LIST_CUE = re.compile(r"무엇이 있|어떤 사항|무슨 일|구성|책무|경우|요건")
+
+
+def is_list_q(q: str) -> bool:
+    """항목을 나열해야 답이 되는 질문인가. 수치·기한형은 제외(압축이 유리)."""
+    if question_type(q) == "기한" or unit_family(q):
+        return False
+    return question_type(q) in LIST_TYPES or bool(LIST_CUE.search(q))
 
 PROMPT = """/no_think
 너는 HACCP을 처음 접하는 품질 담당자를 돕는 안내 도우미다.
@@ -25,6 +36,28 @@ PROMPT = """/no_think
 
 출력은 정확히 아래 세 줄만 쓴다. 다른 말은 절대 쓰지 않는다.
 [설명] 쉽게 1~2문장. 120자 이내.
+[근거] 출처 이름만. 본문을 인용하지 말 것. 예: 제10조, 평가매뉴얼 p.22
+[다음 할 일] 한 문장.
+
+질문: {q}
+
+[근거]
+{ctx}
+"""
+
+PROMPT_LIST = """/no_think
+너는 HACCP을 처음 접하는 품질 담당자를 돕는 안내 도우미다.
+아래 [근거]만 사용해 한국어로 답한다. 근거에 없는 내용은 쓰지 않는다.
+고시 조문과 평가매뉴얼의 내용이 다르면 **고시를 따른다**.
+근거에 나온 용어를 그대로 쓴다(임의로 바꿔 말하지 않는다).
+이 질문은 항목을 나열해야 답이 되는 질문이다. 근거에 적힌 항목(호·목·요건·절차 단계)을 빠짐없이, 최대 5개까지 쓴다.
+각 항목에는 **누가 무엇을 하는지**를 쓴다. “별표/조문을 확인하세요”처럼 출처만 가리키는 항목은 쓰지 않는다.
+
+출력은 정확히 아래 형식만 쓴다. 다른 말은 절대 쓰지 않는다.
+[설명] 한 문장 요약.
+- 항목 1
+- 항목 2
+(근거에 있는 만큼, 최대 5개)
 [근거] 출처 이름만. 본문을 인용하지 말 것. 예: 제10조, 평가매뉴얼 p.22
 [다음 할 일] 한 문장.
 
@@ -114,6 +147,8 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
     (예: “언제까지” → 6개월, “몇 시간” → 16시간).
     """
     flat = " ".join(text.split())
+    if is_list_q(q):                 # A2: 나열형은 항 전체를 넘긴다(압축하면 항목이 잘린다)
+        return flat[:FULL_LIMIT]
     if len(flat) <= limit:
         return flat
     qs = {t for t in tokens(q) if len(t) > 1}
@@ -159,14 +194,22 @@ def _snippet(text: str, q: str, limit: int = 150) -> str:
 
 def build_prompt(q, hits):
     ctx = "\n".join(f"- ({d['source']} {d['label']}) " + _snippet(d["text"], q) for _, d in hits)
-    return PROMPT.format(q=q, ctx=ctx)
+    return (PROMPT_LIST if is_list_q(q) else PROMPT).format(q=q, ctx=ctx)
+
+
+def context_coverage(q, hits):
+    """E1: 검색된 원문 길이 대비 모델에 전달된 길이."""
+    full = sum(len(" ".join(d["text"].split())) for _, d in hits)
+    seen = sum(len(_snippet(d["text"], q)) for _, d in hits)
+    return {"full_chars": full, "seen_chars": seen, "pct": round(100 * seen / full) if full else 0}
 
 
 def _payload(prompt, stream):
+    n = NUM_PREDICT_LIST if "항목을 나열해야 답이 되는 질문" in prompt else NUM_PREDICT
     return json.dumps({
         "model": MODEL, "prompt": prompt, "stream": stream, "raw": False,
         "think": False, "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": 0.0, "seed": 42, "num_predict": NUM_PREDICT},
+        "options": {"temperature": 0.0, "seed": 42, "num_predict": n},
     }).encode()
 
 
@@ -184,6 +227,36 @@ def _clean(raw: str) -> str:
             line = "[근거] " + body
         out.append(line)
     return "\n".join(out).strip()
+
+
+ITEM_PREFIX = re.compile(r"^(\s*-\s*)항목\s*\d+\s*[:：]\s*", re.M)
+
+
+def _cite_label(d) -> str:
+    """검색 결과에서 출처 이름만 뽑는다. 예: 고시 제9조 / 평가매뉴얼 p.432"""
+    if d["source"] == "고시":
+        m = re.match(r"(제[\d의]+조)", d["label"])
+        return "고시 " + (m.group(1) if m else d["label"][:12])
+    return d["label"]
+
+
+def finalize(text: str, hits) -> str:
+    """후처리: 형식 문구 제거, 출력이 잘려 [근거]가 없으면 검색 출처로 채운다."""
+    text = ITEM_PREFIX.sub(r"\1", text)
+    if "[근거]" not in text and hits:
+        seen, labels = set(), []
+        for _, d in hits:
+            lab = _cite_label(d)
+            if lab not in seen:
+                seen.add(lab)
+                labels.append(lab)
+        lines = text.rstrip().split("\n")
+        while lines and re.fullmatch(r"\s*(\[[^\]]{0,6})?\s*", lines[-1]):   # 잘린 태그 조각("[", "[근")·빈 줄 제거
+            lines.pop()
+        if lines and lines[-1].startswith("- ") and not lines[-1].rstrip().endswith((".", "다", "요")):
+            lines[-1] = lines[-1].rstrip() + "…"   # 잘린 항목 표시
+        text = "\n".join(lines) + "\n[근거] " + ", ".join(labels[:4]) + " (자동 표기: 답변이 길어 잘림)"
+    return text
 
 
 def hits_meta(hits):
@@ -236,6 +309,7 @@ def ask(q):
                            "gen1": 0, "gen2": 0, "retried": False}}
     ctx = build_prompt(q, hits)
     text, gen1 = _generate(ctx)
+    text = finalize(text, hits)
     t2 = time.time()
     bad = unsupported_numbers(text, _context_text(hits))
     gen2 = 0.0
@@ -243,8 +317,10 @@ def ask(q):
     if bad:  # 근거에 없는 수치 → 한 번 더 엄격 모드로 재생성
         retried = True
         text, gen2 = _generate(GUARD + ctx)
+        text = finalize(text, hits)
         bad = unsupported_numbers(text, _context_text(hits))
     result = {"answer": text, "hits": hits_meta(hits), "unsupported_numbers": bad,
+              "coverage": context_coverage(q, hits),
               "timing": {"retrieve": round(t1 - t0, 2), "gen1": round(gen1, 2),
                          "gen2": round(gen2, 2), "retried": retried,
                          "total": round(time.time() - t0, 2)}}
@@ -300,7 +376,7 @@ def ask_stream(q):
                 acc += buf
                 out, buf = buf, ""
                 yield out
-        text = _clean(acc)
+        text = finalize(_clean(acc), hits)
         if len(_CACHE) >= CACHE_MAX:
             _CACHE.pop(next(iter(_CACHE)))
         _CACHE[key] = {"answer": text, "hits": meta["hits"], "unsupported_numbers": []}
