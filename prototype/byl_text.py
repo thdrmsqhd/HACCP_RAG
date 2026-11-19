@@ -75,6 +75,64 @@ def chunk(no, paras):
     return out
 
 
+# 평가표형 별표: 줄글로 풀면 “평가 기준 ↔ 비고(처분 등)” 칸 짝이 사라진다.
+# (별표 6의5 ‘기타 사항’: 사유마다 지정취소 / 6개월 정지 / 시정이 다르다)
+# 이 별표들은 PDF 표 칸을 그대로 읽어 행마다 “기준 → 비고”로 쓴다.
+TABLE_BYL = {"6의2", "6의5"}
+TABLE_MIN = 250
+
+
+def _cell(c):
+    return re.sub(r"\s+", " ", (c or "").replace("\n", " ")).strip()
+
+
+def table_items(doc):
+    """표 행 → 평가항목별 문단. 병합 셀(빈 칸)은 위 행의 번호·항목을 이어받는다."""
+    rows = [[_cell(c) for c in r] for p in doc for t in p.find_tables().tables for r in t.extract()]
+    items, cur, section = [], None, ""
+    for r in rows:
+        r = (r + [""] * 5)[:5]
+        no, name, crit, _judge, note = r
+        if no in ("구분", "") and name in ("평가내용", "항목"):
+            continue                                   # 머리 행
+        if no and not no.isdigit() and not any(r[1:]):
+            section = no                               # 구분 행(예: 서류심사, 교육훈련기관 평가)
+            continue
+        if no.isdigit():
+            cur = {"no": no, "name": name, "section": section, "lines": []}
+            items.append(cur)
+        if cur is None or not crit:
+            continue
+        cur["lines"].append((crit.lstrip("◦ ").strip(), note))
+    out = []
+    for it in items:
+        has_note = any(n for _, n in it["lines"])
+        body = []
+        for crit, note in it["lines"]:
+            if note:
+                body.append(f"- {crit} → 비고: {note}")
+            elif has_note:
+                body.append(f"- {crit} → 비고: 표에 따로 적혀 있지 않음")
+            else:
+                body.append(f"- {crit}")
+        head = f"[{it['section']}] {it['no']}. {it['name']}".strip()
+        out.append(head + "\n" + "\n".join(body))
+    return out
+
+
+def table_chunks(no, items):
+    chunks, cur = [], []
+    for it in items:
+        cur.append(it)
+        if sum(map(len, cur)) >= TABLE_MIN:
+            chunks.append(cur)
+            cur = []
+    if cur:
+        (chunks[-1].extend(cur) if chunks and sum(map(len, cur)) < TABLE_MIN // 2 else chunks.append(cur))
+    return [{"byl": no, "title": TITLE.get(no, ""), "part": k, "head": c[0].split("\n")[0][:40],
+             "text": "\n".join(c)} for k, c in enumerate(chunks, 1)]
+
+
 def build():
     rows = []
     for pdf in sorted(DIR.glob("별표_*.pdf")):
@@ -82,6 +140,11 @@ def build():
         if no in SKIP:
             continue
         doc = pymupdf.open(pdf)
+        if no in TABLE_BYL:
+            items = table_items(doc)
+            (DIR / f"별표_{no}.txt").write_text("\n\n".join(items), encoding="utf-8")
+            rows.extend(table_chunks(no, items))
+            continue
         lines = [ln for p in doc for ln in page_lines(p)]
         if lines and lines[0].startswith("[별표"):
             lines = lines[1:]                       # "[별표 4의3]" 머리
